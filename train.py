@@ -14,6 +14,13 @@ import dataloader
 from math import log10
 import datetime
 from tensorboardX import SummaryWriter
+import random
+
+
+random.seed(1337)
+torch.manual_seed(1337)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 # For parsing commandline arguments
@@ -29,6 +36,7 @@ parser.add_argument("--init_learning_rate", type=float, default=0.0001, help='se
 parser.add_argument("--milestones", type=list, default=[100, 150], help='Set to epoch values where you want to decrease learning rate by a factor of 0.1. Default: [100, 150]')
 parser.add_argument("--progress_iter", type=int, default=100, help='frequency of reporting progress and validation. N: after every N iterations. Default: 100.')
 parser.add_argument("--checkpoint_epoch", type=int, default=5, help='checkpoint saving frequency. N: after every N epochs. Each checkpoint is roughly of size 151 MB.Default: 5.')
+parser.add_argument("--debug", type=str, default=None, help='dump model output')
 args = parser.parse_args()
 
 ##[TensorboardX](https://github.com/lanpa/tensorboardX)
@@ -41,6 +49,7 @@ writer = SummaryWriter('log')
 ###Initialize flow computation and arbitrary-time flow interpolation CNNs.
 
 
+assert torch.cuda.is_available()
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 flowComp = model.UNet(6, 4)
 flowComp.to(device)
@@ -68,7 +77,7 @@ normalize = transforms.Normalize(mean=mean,
 transform = transforms.Compose([transforms.ToTensor(), normalize])
 
 trainset = dataloader.SuperSloMo(root=args.dataset_root + '/train', transform=transform, train=True)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=False)
 
 validationset = dataloader.SuperSloMo(root=args.dataset_root + '/validation', transform=transform, randomCropSize=(640, 352), train=False)
 validationloader = torch.utils.data.DataLoader(validationset, batch_size=args.validation_batch_size, shuffle=False)
@@ -208,6 +217,60 @@ valLoss = dict1['valLoss']
 valPSNR = dict1['valPSNR']
 checkpoint_counter = 0
 
+def the_model(I0, I1, IFrame):
+    # Calculate flow between reference frames I0 and I1
+    flowOut = flowComp(torch.cat((I0, I1), dim=1))
+    
+    # Extracting flows between I0 and I1 - F_0_1 and F_1_0
+    F_0_1 = flowOut[:,:2,:,:]
+    F_1_0 = flowOut[:,2:,:,:]
+    
+    fCoeff = model.getFlowCoeff(trainFrameIndex, device)
+    
+    # Calculate intermediate flows
+    F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+    F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+    
+    # Get intermediate frames from the intermediate flows
+    g_I0_F_t_0 = trainFlowBackWarp(I0, F_t_0)
+    g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
+    
+    # Calculate optical flow residuals and visibility maps
+    intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+    
+    # Extract optical flow residuals and visibility maps
+    F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+    F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+    V_t_0   = F.sigmoid(intrpOut[:, 4:5, :, :])
+    V_t_1   = 1 - V_t_0
+    
+    # Get intermediate frames from the intermediate flows
+    g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
+    g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
+    
+    wCoeff = model.getWarpCoeff(trainFrameIndex, device)
+    
+    # Calculate final intermediate frame 
+    Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
+
+    # Loss
+    recnLoss = L1_lossFn(Ft_p, IFrame)
+        
+    prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
+    
+    warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
+    
+    loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
+    loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
+    loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
+      
+    # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
+    # since the loss in paper is calculated for input pixels in range 0-255
+    # and the input to our network is in range 0-1
+    loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+
+    return Ft_p, loss
+
 ### Main training loop
 for epoch in range(dict1['epoch'] + 1, args.epochs):
     print("Epoch: ", epoch)
@@ -232,56 +295,9 @@ for epoch in range(dict1['epoch'] + 1, args.epochs):
         
         optimizer.zero_grad()
         
-        # Calculate flow between reference frames I0 and I1
-        flowOut = flowComp(torch.cat((I0, I1), dim=1))
-        
-        # Extracting flows between I0 and I1 - F_0_1 and F_1_0
-        F_0_1 = flowOut[:,:2,:,:]
-        F_1_0 = flowOut[:,2:,:,:]
-        
-        fCoeff = model.getFlowCoeff(trainFrameIndex, device)
-        
-        # Calculate intermediate flows
-        F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-        F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-        
-        # Get intermediate frames from the intermediate flows
-        g_I0_F_t_0 = trainFlowBackWarp(I0, F_t_0)
-        g_I1_F_t_1 = trainFlowBackWarp(I1, F_t_1)
-        
-        # Calculate optical flow residuals and visibility maps
-        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-        
-        # Extract optical flow residuals and visibility maps
-        F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-        F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-        V_t_0   = F.sigmoid(intrpOut[:, 4:5, :, :])
-        V_t_1   = 1 - V_t_0
-        
-        # Get intermediate frames from the intermediate flows
-        g_I0_F_t_0_f = trainFlowBackWarp(I0, F_t_0_f)
-        g_I1_F_t_1_f = trainFlowBackWarp(I1, F_t_1_f)
-        
-        wCoeff = model.getWarpCoeff(trainFrameIndex, device)
-        
-        # Calculate final intermediate frame 
-        Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-        
-        # Loss
-        recnLoss = L1_lossFn(Ft_p, IFrame)
-            
-        prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-        
-        warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(trainFlowBackWarp(I1, F_0_1), I0)
-        
-        loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-        loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-        loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-          
-        # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
-        # since the loss in paper is calculated for input pixels in range 0-255
-        # and the input to our network is in range 0-1
-        loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
+        Ft_p, loss = the_model(I0, I1, IFrame)
+        if args.debug:
+            torch.save(Ft_p, args.debug)
         
         # Backpropagate
         loss.backward()
