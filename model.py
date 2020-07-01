@@ -127,7 +127,7 @@ class up(nn.Module):
         """
 
         # Bilinear interpolation with scaling 2.
-        x = F.interpolate(x, scale_factor=2, mode='bilinear')
+        x = F.interpolate(x, scale_factor=2., mode='bilinear')
         # Convolution + Leaky ReLU
         x = F.leaky_relu(self.conv1(x), negative_slope = 0.1)
         # Convolution + Leaky ReLU on (`x`, `skpCn`)
@@ -287,9 +287,8 @@ class backWarp(nn.Module):
 
 # Creating an array of `t` values for the 7 intermediate frames between
 # reference frames I0 and I1. 
-t = np.linspace(0.125, 0.875, 7)
 
-def getFlowCoeff (indices, device):
+def getFlowCoeff (indices, device: torch.device):
     """
     Gets flow coefficients used for calculating intermediate optical
     flows from optical flows between I0 and I1: F_0_1 and F_1_0.
@@ -316,16 +315,18 @@ def getFlowCoeff (indices, device):
         tensor
             coefficients C00, C01, C10, C11.
     """
+    t = torch.linspace(0.125, 0.875, 7)
 
 
     # Convert indices tensor to numpy array
-    ind = indices.detach().numpy()
+    # ind = indices.detach().numpy()
+    ind = indices
     C11 = C00 = - (1 - (t[ind])) * (t[ind])
     C01 = (t[ind]) * (t[ind])
     C10 = (1 - (t[ind])) * (1 - (t[ind]))
-    return torch.Tensor(C00)[None, None, None, :].permute(3, 0, 1, 2).to(device), torch.Tensor(C01)[None, None, None, :].permute(3, 0, 1, 2).to(device), torch.Tensor(C10)[None, None, None, :].permute(3, 0, 1, 2).to(device), torch.Tensor(C11)[None, None, None, :].permute(3, 0, 1, 2).to(device)
+    return C00[None, None, None, :].permute(3, 0, 1, 2).to(device), C01[None, None, None, :].permute(3, 0, 1, 2).to(device), C10[None, None, None, :].permute(3, 0, 1, 2).to(device), C11[None, None, None, :].permute(3, 0, 1, 2).to(device)
 
-def getWarpCoeff (indices, device):
+def getWarpCoeff (indices, device: torch.device):
     """
     Gets coefficients used for calculating final intermediate 
     frame `It_gen` from backwarped images using flows F_t_0 and F_t_1.
@@ -352,10 +353,11 @@ def getWarpCoeff (indices, device):
         tensor
             coefficients C0 and C1.
     """
+    t = torch.linspace(0.125, 0.875, 7)
 
 
     # Convert indices tensor to numpy array
-    ind = indices.detach().numpy()
+    ind = indices
     C0 = 1 - t[ind]
     C1 = t[ind]
-    return torch.Tensor(C0)[None, None, None, :].permute(3, 0, 1, 2).to(device), torch.Tensor(C1)[None, None, None, :].permute(3, 0, 1, 2).to(device)
+    return C0[None, None, None, :].permute(3, 0, 1, 2).to(device), C1[None, None, None, :].permute(3, 0, 1, 2).to(device)
