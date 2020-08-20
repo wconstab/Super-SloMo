@@ -10,6 +10,7 @@ import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
 import model
+from model_wrapper import Model
 import dataloader
 from math import log10
 import datetime
@@ -84,90 +85,12 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-###Loss and Optimizer
+###Model, Loss and Optimizer
 
-
-L1_lossFn = nn.L1Loss()
-MSE_LossFn = nn.MSELoss()
-
-
-class Model(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.flowComp = model.UNet(6, 4).to(device)
-        self.ArbTimeFlowIntrp = model.UNet(20, 5).to(device)
-        self.trainFlowBackWarp = model.backWarp(352, 352, device)
-
-    def forward(self, trainFrameIndex, I0, I1, IFrame):
-        # Calculate flow between reference frames I0 and I1
-        flowOut = self.flowComp(torch.cat((I0, I1), dim=1))
-        
-        # Extracting flows between I0 and I1 - F_0_1 and F_1_0
-        F_0_1 = flowOut[:,:2,:,:]
-        F_1_0 = flowOut[:,2:,:,:]
-        
-        fCoeff = model.getFlowCoeff(trainFrameIndex, I0.device)
-        
-        # Calculate intermediate flows
-        F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
-        F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
-        
-        # Get intermediate frames from the intermediate flows
-        g_I0_F_t_0 = self.trainFlowBackWarp(I0, F_t_0)
-        g_I1_F_t_1 = self.trainFlowBackWarp(I1, F_t_1)
-        
-        # Calculate optical flow residuals and visibility maps
-        intrpOut = self.ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
-        
-        # Extract optical flow residuals and visibility maps
-        F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
-        F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
-        V_t_0   = F.sigmoid(intrpOut[:, 4:5, :, :])
-        V_t_1   = 1 - V_t_0
-        
-        # Get intermediate frames from the intermediate flows
-        g_I0_F_t_0_f = self.trainFlowBackWarp(I0, F_t_0_f)
-        g_I1_F_t_1_f = self.trainFlowBackWarp(I1, F_t_1_f)
-        
-        wCoeff = model.getWarpCoeff(trainFrameIndex, I0.device)
-        
-        # Calculate final intermediate frame 
-        Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1)
-
-        # Loss
-        recnLoss = L1_lossFn(Ft_p, IFrame)
-            
-        prcpLoss = MSE_LossFn(vgg16_conv_4_3(Ft_p), vgg16_conv_4_3(IFrame))
-        
-        warpLoss = L1_lossFn(g_I0_F_t_0, IFrame) + L1_lossFn(g_I1_F_t_1, IFrame) + L1_lossFn(self.trainFlowBackWarp(I0, F_1_0), I1) + L1_lossFn(self.trainFlowBackWarp(I1, F_0_1), I0)
-        
-        loss_smooth_1_0 = torch.mean(torch.abs(F_1_0[:, :, :, :-1] - F_1_0[:, :, :, 1:])) + torch.mean(torch.abs(F_1_0[:, :, :-1, :] - F_1_0[:, :, 1:, :]))
-        loss_smooth_0_1 = torch.mean(torch.abs(F_0_1[:, :, :, :-1] - F_0_1[:, :, :, 1:])) + torch.mean(torch.abs(F_0_1[:, :, :-1, :] - F_0_1[:, :, 1:, :]))
-        loss_smooth = loss_smooth_1_0 + loss_smooth_0_1
-          
-        # Total Loss - Coefficients 204 and 102 are used instead of 0.8 and 0.4
-        # since the loss in paper is calculated for input pixels in range 0-255
-        # and the input to our network is in range 0-1
-        loss = 204 * recnLoss + 102 * warpLoss + 0.005 * prcpLoss + loss_smooth
-
-        return Ft_p, loss
-
-the_model = Model()
-
-
+the_model = Model(device)
 optimizer = optim.Adam(the_model.parameters(), lr=args.init_learning_rate)
 # scheduler to decrease learning rate by a factor of 10 at milestones.
 scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
-
-
-###Initializing VGG16 model for perceptual loss
-
-
-vgg16 = torchvision.models.vgg16(pretrained=True)
-vgg16_conv_4_3 = nn.Sequential(*list(vgg16.children())[0][:22])
-vgg16_conv_4_3.to(device)
-for param in vgg16_conv_4_3.parameters():
-		param.requires_grad = False
 
 
 ### Initialization
