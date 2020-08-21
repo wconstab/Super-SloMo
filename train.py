@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
-import model
+import slomo_model as model
 from model_wrapper import Model
 import dataloader
 from math import log10

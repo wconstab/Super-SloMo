@@ -7,7 +7,7 @@ from shutil import rmtree, move
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
-import model
+import slomo_model as model
 import dataloader
 import platform
 from tqdm import tqdm

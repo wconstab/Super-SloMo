@@ -7,7 +7,7 @@ import cv2
 import torch
 from PIL import Image
 import numpy as np
-import model
+import slomo_model as model
 from torchvision import transforms
 from torch.functional import F
 
